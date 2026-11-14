@@ -1,8 +1,13 @@
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
 import { Daytona, Sandbox } from '@daytona/sdk'
+import { tavily } from '@tavily/core'
 
 export const CSV_PATH = '/tmp/shop/sales.csv'
 export const CHART_PATH = '/tmp/shop/chart.png'
+export const HELPER_PATH = '/tmp/shop/losslens.py'
+const HELPER_CODE = readFileSync(path.join(__dirname, 'losslens.py'))
 
 export type ShopSummary = {
   rows: number
@@ -12,7 +17,9 @@ export type ShopSummary = {
   items: string[]
 }
 
-type Shop = { sandbox: Sandbox; summary: ShopSummary; createdAt: number }
+type Shop = { sandbox: Sandbox; summary: ShopSummary; createdAt: number; backtest?: Promise<BacktestResult> }
+
+export type BacktestResult = Record<string, unknown> & { netSaving: number; ms: number }
 
 const shops = new Map<string, Shop>()
 let daytona: Daytona | null = null
@@ -112,7 +119,8 @@ export async function createShop(
   warmSpare() // get the next one ready for the next upload
   try {
     await sandbox.fs.uploadFile(csv, CSV_PATH)
-    log(`[daytona] uploaded CSV (${csv.length} bytes) -> ${CSV_PATH}`)
+    await sandbox.fs.uploadFile(HELPER_CODE, HELPER_PATH)
+    log(`[daytona] uploaded CSV (${csv.length} bytes) -> ${CSV_PATH} and helper -> ${HELPER_PATH}`)
 
     const res = await sandbox.process.codeRun(SUMMARY_CODE)
     if (res.exitCode !== 0) throw new Error(`summary failed: ${res.result.slice(-500)}`)
@@ -171,6 +179,95 @@ export async function runPython(shopId: string, code: string): Promise<PythonRes
     log(`[tool] run_python FAILED: ${(err as Error).message}`)
     return { ok: false, output: `Sandbox error: ${(err as Error).message}` }
   }
+}
+
+// Item 9: fixed backtest script (not AI-written), run once per shop in its sandbox and cached.
+const BACKTEST_CODE = `
+import sys, json
+sys.path.insert(0, '/tmp/shop')
+from losslens import backtest
+print(json.dumps(backtest(days=30), ensure_ascii=False))
+`
+
+export function runBacktest(shopId: string): Promise<BacktestResult> {
+  const shop = shops.get(shopId)
+  if (!shop) return Promise.reject(new Error('shop not found'))
+  if (!shop.backtest) {
+    shop.backtest = (async () => {
+      const t0 = Date.now()
+      log(`[tool] backtest (fixed script) for shop ${shopId}...`)
+      const res = await shop.sandbox.process.codeRun(BACKTEST_CODE, undefined, 120)
+      if (res.exitCode !== 0) throw new Error(`backtest failed: ${res.result.slice(-300)}`)
+      const out = JSON.parse(res.result.trim().split('\n').pop() ?? '{}')
+      const ms = Date.now() - t0
+      log(`[tool] backtest OK: net saving ¥${out.netSaving} over ${out.days} days (${ms} ms)`)
+      return { ...out, ms }
+    })()
+    shop.backtest.catch(() => {
+      shop.backtest = undefined // allow a retry
+    })
+  }
+  return shop.backtest
+}
+
+// M4: tomorrow's weather + local events from Tavily. Tomorrow is computed in Asia/Tokyo time.
+let tvly: ReturnType<typeof tavily> | null = null
+
+export function tomorrowTokyo(): { date: string; weekday: string; jpLabel: string; year: number } {
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Tokyo' }).format(new Date()) // YYYY-MM-DD
+  const [y, m, d] = today.split('-').map(Number)
+  const t = new Date(Date.UTC(y, m - 1, d + 1))
+  return {
+    date: t.toISOString().slice(0, 10),
+    weekday: '日月火水木金土'[t.getUTCDay()],
+    jpLabel: `${t.getUTCMonth() + 1}月${t.getUTCDate()}日`,
+    year: t.getUTCFullYear(),
+  }
+}
+
+type SearchSummary = { summary: string; sources: { title: string; url: string; snippet: string }[] } | { error: string }
+
+export async function getTomorrowContext(area: string): Promise<{ ok: boolean; queries: string; output: string }> {
+  const place = area.trim() || '東京都品川区'
+  const tm = tomorrowTokyo()
+  const qWeather = `${place} 天気予報 ${tm.jpLabel}(${tm.weekday})`
+  const qEvents = `${place} イベント ${tm.year}年${tm.jpLabel}`
+  const queries = `${qWeather}\n${qEvents}`
+  const t0 = Date.now()
+  log(`[tool] get_tomorrow_context: ${place} for ${tm.date} (${tm.weekday})`)
+  if (!tvly) tvly = tavily({ apiKey: process.env.TAVILY_API_KEY ?? '' })
+  const client = tvly
+  const search = async (q: string): Promise<SearchSummary> => {
+    try {
+      const r = await client.search(q, { maxResults: 4, includeAnswer: true, searchDepth: 'basic', timeout: 15 })
+      return {
+        summary: r.answer ?? '',
+        sources: r.results.map((x) => ({
+          title: x.title.slice(0, 100),
+          url: x.url,
+          snippet: x.content.replace(/\s+/g, ' ').slice(0, 200),
+        })),
+      }
+    } catch (err) {
+      return { error: (err as Error).message }
+    }
+  }
+  const [weather, events] = await Promise.all([search(qWeather), search(qEvents)])
+  const ok = !('error' in weather) || !('error' in events)
+  log(`[tool] get_tomorrow_context ${ok ? 'OK' : 'ERROR'} (${Date.now() - t0} ms)`)
+  const output = JSON.stringify(
+    {
+      tomorrow: tm.date,
+      weekday: tm.weekday,
+      area: place,
+      weather,
+      events,
+      note: 'Web search results can be old or for another date. Check the dates in titles/snippets.',
+    },
+    null,
+    1,
+  )
+  return { ok, queries, output }
 }
 
 /** Delete every sandbox we created. Called on shutdown. */

@@ -2,7 +2,7 @@ import 'dotenv/config'
 import path from 'node:path'
 import express, { NextFunction, Request, Response } from 'express'
 import multer from 'multer'
-import { createShop, deleteAllSandboxes, getShop, warmSpare } from './tools'
+import { createShop, deleteAllSandboxes, getShop, runBacktest, warmSpare } from './tools'
 import { friendlyError, runAgent } from './agent'
 
 const app = express()
@@ -49,6 +49,21 @@ app.post('/api/chat', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[chat] failed:', err)
     res.status(500).json({ error: friendlyError(err) })
+  }
+})
+
+// Item 9: fixed 30-day backtest in the shop's sandbox (same number every time).
+app.post('/api/backtest', async (req: Request, res: Response) => {
+  const { shopId } = req.body ?? {}
+  if (typeof shopId !== 'string' || !getShop(shopId)) {
+    res.status(404).json({ error: 'Shop not found. Please upload your CSV first.' })
+    return
+  }
+  try {
+    res.json(await runBacktest(shopId))
+  } catch (err) {
+    console.error('[backtest] failed:', (err as Error).message)
+    res.status(500).json({ error: 'Could not run the backtest.' })
   }
 })
 
